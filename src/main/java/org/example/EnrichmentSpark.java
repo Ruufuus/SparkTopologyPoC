@@ -34,69 +34,15 @@ public class EnrichmentSpark {
             init(args[0]);
 
             // Load our input data.
-            JavaRDD<TaskData> filesToEnrich = sparkContext.textFile(basePath + "input.txt", 3).toJavaRDD().map(taskData -> {
-                String[] taskInfo = taskData.split(" ");
-                return new TaskData(taskInfo[0], taskInfo[1], taskInfo[2]);
-            });
+            JavaRDD<TaskData> filesToEnrich = loadTaskData();
 
-            JavaRDD<TaskData> fileData = filesToEnrich.map(fd -> {
-                fd.setFileContent(fileReader.readFileData(fd.getFileUrl()));
-                return fd;
-            });
+            JavaRDD<TaskData> fileData = loadFileContent(filesToEnrich);
 
-            JavaRDD<TaskData> enrichedFileData = fileData.map(fd -> {
-                ProcessedResult<String> pr = enricher.enrich(fd.getFileContent());
-                fd.setResultFileContent(pr.getProcessedRecord());
-                fd.setReportSet(pr.getReport());
-                fd.setProcessingStatus(pr.getRecordStatus().toString());
-                return fd;
-            });
+            JavaRDD<TaskData> enrichedFileData = enrichFileContent(fileData);
 
+            saveTaskRecordStatuses(enrichedFileData);
 
-            JavaRDD<Tuple2<String, String>> enrichmentStatuses = enrichedFileData
-                    .mapToPair(
-                            result -> new Tuple2<>(
-                                    result.getProcessingStatus(),
-                                    new Tuple2<>(
-                                            1,
-                                            result.getTaskId()
-                                    )
-                            )
-                    ).reduceByKey((a, b) -> new Tuple2<>(
-                                    a._1 + b._1,
-                                    a._2
-                            )
-                    )
-                    .map(result -> new Tuple2<>(
-                            result._2._2,
-                            String.format("Level:%s, Count:%s", result._1, result._2._1)
-                    ));
-            enrichmentStatuses.saveAsTextFile(basePath + "statuses");
-
-            JavaRDD<Tuple2<String, List<String>>> enrichmentErrorReports = enrichedFileData
-                    .map(
-                            result -> new Tuple2<>(
-                                    result.getTaskId(),
-                                    result.getReportSet()
-                                            .stream()
-                                            .filter(report -> report.getMessageType() == Type.ERROR)
-                                            .map(report -> report.getMessage() + ";" + report.getMessageType() + ";" + report.getValue() + ";" + report.getMode() + ";" + report.getStackTrace())
-                                            .collect(Collectors.toList())
-                            )
-                    );
-            enrichmentErrorReports.saveAsTextFile(basePath + "error_reports");
-
-            JavaRDD<Tuple2<String, List<String>>> enrichmentWarningReports = enrichedFileData
-                    .map(
-                            result -> new Tuple2<>(
-                                    result.getTaskId(),
-                                    result.getReportSet()
-                                            .stream()
-                                            .filter(report -> report.getMessageType() == Type.WARN)
-                                            .map(report -> report.getMessage() + ";" + report.getMessageType() + ";" + report.getValue() + ";" + report.getMode() + ";" + report.getStackTrace())
-                                            .collect(Collectors.toList()))
-                    );
-            enrichmentWarningReports.saveAsTextFile(basePath + "warning_reports");
+            saveTaskReports(enrichedFileData);
 
             JavaRDD<Tuple2<String, String>> enrichedContent = enrichedFileData
                     .filter((taskData -> taskData.getResultFileContent() != null && !taskData.getProcessingStatus().equals(ProcessedResult.RecordStatus.STOP.toString())))
@@ -108,12 +54,74 @@ public class EnrichmentSpark {
                     );
             enrichedContent.saveAsTextFile(basePath + "result");
 
+
             System.out.println("Input anything to end Spark process!");
             new Scanner(System.in).nextLine();
             sparkContext.cleaner();
         } else {
             LOGGER.error("Config file is not provided!, Please provide config file as program arguments");
         }
+    }
+
+    private static void saveTaskReports(JavaRDD<TaskData> enrichedFileData) {
+        JavaRDD<Tuple2<String, List<String>>> enrichmentReports = enrichedFileData
+                .map(
+                        result -> new Tuple2<>(
+                                result.getTaskId(),
+                                result.getReportSet()
+                                        .stream()
+                                        .filter(report -> report.getMessageType() != Type.IGNORE)
+                                        .map(report -> report.getMessageType() + ";" + report.getMessage() + ";" + report.getValue() + ";" + report.getMode() + ";" + report.getStackTrace())
+                                        .collect(Collectors.toList())
+                        )
+                );
+        enrichmentReports.saveAsTextFile(basePath + "task_reports");
+    }
+
+    private static void saveTaskRecordStatuses(JavaRDD<TaskData> enrichedFileData) {
+        JavaRDD<Tuple2<String, String>> enrichmentStatuses = enrichedFileData
+                .mapToPair(
+                        result -> new Tuple2<>(
+                                result.getProcessingStatus(),
+                                new Tuple2<>(
+                                        1,
+                                        result.getTaskId()
+                                )
+                        )
+                ).reduceByKey((a, b) -> new Tuple2<>(
+                                a._1 + b._1,
+                                a._2
+                        )
+                )
+                .map(result -> new Tuple2<>(
+                        result._2._2,
+                        String.format("Level:%s, Count:%s", result._1, result._2._1)
+                ));
+        enrichmentStatuses.saveAsTextFile(basePath + "statuses");
+    }
+
+    private static JavaRDD<TaskData> enrichFileContent(JavaRDD<TaskData> fileData) {
+        return fileData.map(fd -> {
+            ProcessedResult<String> pr = enricher.enrich(fd.getFileContent());
+            fd.setResultFileContent(pr.getProcessedRecord());
+            fd.setReportSet(pr.getReport());
+            fd.setProcessingStatus(pr.getRecordStatus().toString());
+            return fd;
+        });
+    }
+
+    private static JavaRDD<TaskData> loadFileContent(JavaRDD<TaskData> filesToEnrich) {
+        return filesToEnrich.map(fd -> {
+            fd.setFileContent(fileReader.readFileData(fd.getFileUrl()));
+            return fd;
+        });
+    }
+
+    private static JavaRDD<TaskData> loadTaskData() {
+        return sparkContext.textFile(basePath + "input.txt", 3).toJavaRDD().map(taskData -> {
+            String[] taskInfo = taskData.split(" ");
+            return new TaskData(taskInfo[0], taskInfo[1], taskInfo[2]);
+        });
     }
 
     @NotNull
