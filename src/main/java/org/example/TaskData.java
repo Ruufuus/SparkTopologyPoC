@@ -6,9 +6,20 @@ import java.util.Date;
 import java.util.Set;
 
 public class TaskData {
+
+    private boolean isFailed = false;
     private String taskId;
     private String taskName;
     private String fileUrl;
+
+    public boolean isFailed() {
+        return isFailed;
+    }
+
+    public void setFailed(boolean failed) {
+        isFailed = failed;
+    }
+
     private Date taskStartDate;
     private String fileContent;
     private String resultFileContent;

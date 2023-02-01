@@ -3,13 +3,16 @@ package org.example;
 import eu.europeana.enrichment.rest.client.report.ProcessedResult;
 import eu.europeana.enrichment.rest.client.report.Type;
 import org.apache.log4j.Level;
+import org.apache.log4j.LogManager;
 import org.apache.log4j.Logger;
 import org.apache.spark.SparkConf;
 import org.apache.spark.SparkContext;
 import org.apache.spark.api.java.JavaRDD;
+import org.apache.spark.storage.StorageLevel;
+import org.apache.spark.util.LongAccumulator;
 import org.jetbrains.annotations.NotNull;
-import org.slf4j.LoggerFactory;
 import scala.Tuple2;
+import scala.Tuple3;
 
 import java.io.FileInputStream;
 import java.io.IOException;
@@ -22,17 +25,19 @@ import java.util.stream.Collectors;
 public class EnrichmentSpark {
 
 
-    private static final org.slf4j.Logger LOGGER = LoggerFactory.getLogger(EnrichmentSpark.class);
+    private static final Logger LOGGER = LogManager.getRootLogger();
     private static final Properties enrichmentProperties = new Properties();
     private static final String basePath = "/home/rafal/Pulpit/spark/";
     private static Enricher enricher;
-    private static FileReader fileReader;
+    private static FileManager fileManager;
     private static SparkContext sparkContext;
 
     public static void main(String[] args) {
         if (args.length > 0) {
             init(args[0]);
 
+            LongAccumulator successfulTaskNumberAccumulator = sparkContext.longAccumulator();
+            LongAccumulator failedTaskNumberAccumulator = sparkContext.longAccumulator();
             // Load our input data.
             JavaRDD<TaskData> filesToEnrich = loadTaskData();
 
@@ -40,21 +45,17 @@ public class EnrichmentSpark {
 
             JavaRDD<TaskData> enrichedFileData = enrichFileContent(fileData);
 
+            enrichedFileData.persist(StorageLevel.MEMORY_ONLY());
+
             saveTaskRecordStatuses(enrichedFileData);
 
             saveTaskReports(enrichedFileData);
 
-            JavaRDD<Tuple2<String, String>> enrichedContent = enrichedFileData
-                    .filter((taskData -> taskData.getResultFileContent() != null && !taskData.getProcessingStatus().equals(ProcessedResult.RecordStatus.STOP.toString())))
-                    .map(taskData ->
-                            new Tuple2<>(
-                                    taskData.getTaskId(),
-                                    taskData.getResultFileContent()
-                            )
-                    );
-            enrichedContent.saveAsTextFile(basePath + "result");
+            saveResult(successfulTaskNumberAccumulator, enrichedFileData);
 
+            saveFailures(failedTaskNumberAccumulator, enrichedFileData);
 
+            saveDiagnosticData(successfulTaskNumberAccumulator, failedTaskNumberAccumulator);
             System.out.println("Input anything to end Spark process!");
             new Scanner(System.in).nextLine();
             sparkContext.cleaner();
@@ -63,11 +64,58 @@ public class EnrichmentSpark {
         }
     }
 
+
+    // Instead of music reduce by key I used accumulators there.
+    // It is not safe because it is used inside map function witch might be rerun when:
+    // - task is progressing slowly making supervisor run copy of the task
+    // - spark fails inside map function
+    // - if supervisor crashes
+    // accumulators are advised to be only used inside spark foreach functions which are not bound to modify any RDDs.
+
+    private static void saveDiagnosticData(LongAccumulator successfulTaskNumberAccumulator, LongAccumulator failedTaskNumberAccumulator) {
+        try {
+            LOGGER.info("Saving diagnostic data");
+            fileManager.saveFileData(basePath + "diagnostic_data", String.format("Number of successfully ended tasks:\t%s%nNumber of failed tasks:\t%s%n",
+                    successfulTaskNumberAccumulator.value().toString(), failedTaskNumberAccumulator.value().toString()));
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private static void saveFailures(LongAccumulator failedTaskNumberAccumulator, JavaRDD<TaskData> enrichedFileData) {
+        JavaRDD<Tuple2<String, String>> failures = enrichedFileData
+                .filter(TaskData::isFailed)
+                .map(taskData -> {
+                    LOGGER.info("Incrementing failed task counter");
+                    failedTaskNumberAccumulator.add(1);
+                    return new Tuple2<>(taskData.getTaskId(), taskData.getFileUrl());
+                });
+        failures.saveAsTextFile(basePath + "failures");
+    }
+
+    private static void saveResult(LongAccumulator successfulTaskNumberAccumulator, JavaRDD<TaskData> enrichedFileData) {
+        JavaRDD<Tuple3<String, String, String>> enrichedContent = enrichedFileData
+                .filter(efd -> !efd.isFailed())
+                .filter((taskData -> taskData.getResultFileContent() != null && !taskData.getProcessingStatus().equals(ProcessedResult.RecordStatus.STOP.toString())))
+                .map(taskData -> {
+                            LOGGER.info("Incrementing Successful task counter");
+                            successfulTaskNumberAccumulator.add(1);
+                            return new Tuple3<>(
+                                    taskData.getTaskId(),
+                                    taskData.getFileUrl(),
+                                    taskData.getResultFileContent()
+                            );
+                        }
+                );
+        enrichedContent.saveAsTextFile(basePath + "result");
+    }
+
     private static void saveTaskReports(JavaRDD<TaskData> enrichedFileData) {
-        JavaRDD<Tuple2<String, List<String>>> enrichmentReports = enrichedFileData
+        JavaRDD<Tuple3<String, String, List<String>>> enrichmentReports = enrichedFileData
                 .map(
-                        result -> new Tuple2<>(
+                        result -> new Tuple3<>(
                                 result.getTaskId(),
+                                result.getFileUrl(),
                                 result.getReportSet()
                                         .stream()
                                         .filter(report -> report.getMessageType() != Type.IGNORE)
@@ -78,6 +126,8 @@ public class EnrichmentSpark {
         enrichmentReports.saveAsTextFile(basePath + "task_reports");
     }
 
+    // Counting how many records ended up with status STOP and how many with CONTINUE
+    // Similar way of counting might be used for counting any multiple partition wide data.
     private static void saveTaskRecordStatuses(JavaRDD<TaskData> enrichedFileData) {
         JavaRDD<Tuple2<String, String>> enrichmentStatuses = enrichedFileData
                 .mapToPair(
@@ -102,23 +152,31 @@ public class EnrichmentSpark {
 
     private static JavaRDD<TaskData> enrichFileContent(JavaRDD<TaskData> fileData) {
         return fileData.map(fd -> {
-            ProcessedResult<String> pr = enricher.enrich(fd.getFileContent());
-            fd.setResultFileContent(pr.getProcessedRecord());
-            fd.setReportSet(pr.getReport());
-            fd.setProcessingStatus(pr.getRecordStatus().toString());
-            return fd;
+            try {
+                ProcessedResult<String> pr = enricher.enrich(fd.getFileContent());
+                fd.setResultFileContent(pr.getProcessedRecord());
+                fd.setReportSet(pr.getReport());
+                fd.setProcessingStatus(pr.getRecordStatus().toString());
+                fd.setFailed(ProcessedResult.RecordStatus.STOP.equals(pr.getRecordStatus()));
+                return fd;
+            } catch (Exception e) {
+                LOGGER.error("Exception while Enriching/dereference", e);
+                fd.setFailed(true);
+                return fd;
+            }
         });
     }
 
     private static JavaRDD<TaskData> loadFileContent(JavaRDD<TaskData> filesToEnrich) {
         return filesToEnrich.map(fd -> {
-            fd.setFileContent(fileReader.readFileData(fd.getFileUrl()));
+            fd.setFileContent(fileManager.readFileData(fd.getFileUrl()));
             return fd;
         });
     }
 
     private static JavaRDD<TaskData> loadTaskData() {
         return sparkContext.textFile(basePath + "input.txt", 3).toJavaRDD().map(taskData -> {
+            LOGGER.info(String.format("New task data:%s", taskData));
             String[] taskInfo = taskData.split(" ");
             return new TaskData(taskInfo[0], taskInfo[1], taskInfo[2]);
         });
@@ -139,7 +197,7 @@ public class EnrichmentSpark {
                 enrichmentProperties.getProperty("ENTITY_API_URL"),
                 enrichmentProperties.getProperty("ENTITY_API_KEY"));
 
-        fileReader = new FileReader();
+        fileManager = new FileManager();
 
         // Disable logging
         Logger.getLogger("org").setLevel(Level.OFF);
