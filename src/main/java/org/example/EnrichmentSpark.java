@@ -65,7 +65,7 @@ public class EnrichmentSpark {
     }
 
 
-    // Instead of music reduce by key I used accumulators there.
+    // Instead of map reduce by key I used accumulators there.
     // It is not safe because it is used inside map function witch might be rerun when:
     // - task is progressing slowly making supervisor run copy of the task
     // - spark fails inside map function
