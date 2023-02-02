@@ -158,7 +158,12 @@ public class EnrichmentSpark {
                 fd.setReportSet(pr.getReport());
                 fd.setProcessingStatus(pr.getRecordStatus().toString());
                 fd.setFailed(ProcessedResult.RecordStatus.STOP.equals(pr.getRecordStatus()));
+                if (Math.random() >= 0.5) {
+                    LOGGER.info("Exception thrown!");
+                    throw new RuntimeException();
+                }
                 return fd;
+                // Detection exception threw in previous RDDs will require some kind of flag that will show it
             } catch (Exception e) {
                 LOGGER.error("Exception while Enriching/dereference", e);
                 fd.setFailed(true);
