@@ -95,6 +95,7 @@ public class EnrichmentSpark {
 
     private static void saveResult(LongAccumulator successfulTaskNumberAccumulator, JavaRDD<TaskData> enrichedFileData) {
         JavaRDD<Tuple3<String, String, String>> enrichedContent = enrichedFileData
+                // Checking flag in order to stop processing
                 .filter(efd -> !efd.isFailed())
                 .filter((taskData -> taskData.getResultFileContent() != null && !taskData.getProcessingStatus().equals(ProcessedResult.RecordStatus.STOP.toString())))
                 .map(taskData -> {
