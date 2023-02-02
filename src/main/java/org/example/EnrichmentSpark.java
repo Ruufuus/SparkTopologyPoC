@@ -27,14 +27,14 @@ public class EnrichmentSpark {
 
     private static final Logger LOGGER = LogManager.getRootLogger();
     private static final Properties enrichmentProperties = new Properties();
-    private static final String basePath = "/home/rafal/Pulpit/spark/";
+    private static String basePath;
     private static Enricher enricher;
     private static FileManager fileManager;
     private static SparkContext sparkContext;
 
     public static void main(String[] args) {
-        if (args.length > 0) {
-            init(args[0]);
+        if (args.length == 2) {
+            init(args[0], args[1]);
 
             LongAccumulator successfulTaskNumberAccumulator = sparkContext.longAccumulator();
             LongAccumulator failedTaskNumberAccumulator = sparkContext.longAccumulator();
@@ -181,7 +181,7 @@ public class EnrichmentSpark {
     }
 
     private static JavaRDD<TaskData> loadTaskData() {
-        return sparkContext.textFile(basePath + "input.txt", 3).toJavaRDD().map(taskData -> {
+        return sparkContext.textFile(basePath + "input", 3).toJavaRDD().map(taskData -> {
             LOGGER.info(String.format("New task data:%s", taskData));
             String[] taskInfo = taskData.split(" ");
             return new TaskData(taskInfo[0], taskInfo[1], taskInfo[2]);
@@ -189,7 +189,10 @@ public class EnrichmentSpark {
     }
 
     @NotNull
-    private static void init(String configFile) {
+    private static void init(String configFile, String sparkDataPath) {
+
+        basePath = sparkDataPath;
+
         try (FileInputStream fileInput = new FileInputStream(configFile)) {
             LOGGER.info("Config file provided!");
             enrichmentProperties.load(fileInput);
