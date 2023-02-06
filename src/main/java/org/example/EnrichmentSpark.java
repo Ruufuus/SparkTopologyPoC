@@ -76,14 +76,21 @@ public class EnrichmentSpark {
     // Throttling this way is resource consuming and might end up in out of memory exception due to limited partition memory
     // Additionally spark might run copy of task if it notices that processing is slow.
     private static JavaRDD<TaskData> rethrottleData(int defaultPartitionCount, JavaRDD<TaskData> enrichedThrottledFileData) {
-        LOGGER.info(String.format("Re-throttling data to %s partitions", defaultPartitionCount));
-        return enrichedThrottledFileData.repartition(defaultPartitionCount);
+        JavaRDD<TaskData> rethrottledData = enrichedThrottledFileData.repartition(defaultPartitionCount);
+        LOGGER.info(String.format("Re-throttling data to %s partitions", rethrottledData.getNumPartitions()));
+        return rethrottledData;
     }
 
 
     private static JavaRDD<TaskData> throttleData(JavaRDD<TaskData> fileData) {
-        LOGGER.info(String.format("Throttling data to %s partitions", throttlingLevel));
-        return fileData.coalesce(throttlingLevel);
+        if (throttlingLevel > fileData.getNumPartitions()) {
+            LOGGER.info("Current partition number is lower than throttle level. Partition count will stay same");
+            return fileData;
+        } else {
+            JavaRDD<TaskData> throttledData = fileData.coalesce(throttlingLevel);
+            LOGGER.info(String.format("Throttling data to %s partitions", throttledData.getNumPartitions()));
+            return throttledData;
+        }
     }
 
 
