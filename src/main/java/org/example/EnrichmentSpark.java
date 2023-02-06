@@ -32,9 +32,12 @@ public class EnrichmentSpark {
     private static FileManager fileManager;
     private static SparkContext sparkContext;
 
+    private static int throttlingLevel;
+
     public static void main(String[] args) {
-        if (args.length == 2) {
-            init(args[0], args[1]);
+        if (args.length == 3) {
+            init(args);
+
 
             LongAccumulator successfulTaskNumberAccumulator = sparkContext.longAccumulator();
             LongAccumulator failedTaskNumberAccumulator = sparkContext.longAccumulator();
@@ -43,7 +46,13 @@ public class EnrichmentSpark {
 
             JavaRDD<TaskData> fileData = loadFileContent(filesToEnrich);
 
-            JavaRDD<TaskData> enrichedFileData = enrichFileContent(fileData);
+            int defaultPartitionCount = fileData.getNumPartitions();
+
+            JavaRDD<TaskData> throttledData = throttleData(fileData);
+
+            JavaRDD<TaskData> enrichedThrottledFileData = enrichFileContent(throttledData);
+
+            JavaRDD<TaskData> enrichedFileData = rethrottleData(defaultPartitionCount, enrichedThrottledFileData);
 
             enrichedFileData.persist(StorageLevel.MEMORY_ONLY());
 
@@ -62,6 +71,19 @@ public class EnrichmentSpark {
         } else {
             LOGGER.error("Config file is not provided!, Please provide config file as program arguments");
         }
+    }
+
+    // Throttling this way is resource consuming and might end up in out of memory exception due to limited partition memory
+    // Additionally spark might run copy of task if it notices that processing is slow.
+    private static JavaRDD<TaskData> rethrottleData(int defaultPartitionCount, JavaRDD<TaskData> enrichedThrottledFileData) {
+        LOGGER.info(String.format("Re-throttling data to %s partitions", defaultPartitionCount));
+        return enrichedThrottledFileData.repartition(defaultPartitionCount);
+    }
+
+
+    private static JavaRDD<TaskData> throttleData(JavaRDD<TaskData> fileData) {
+        LOGGER.info(String.format("Throttling data to %s partitions", throttlingLevel));
+        return fileData.coalesce(throttlingLevel);
     }
 
 
@@ -189,16 +211,19 @@ public class EnrichmentSpark {
     }
 
     @NotNull
-    private static void init(String configFile, String sparkDataPath) {
+    private static void init(String[] args) {
 
-        basePath = sparkDataPath;
 
-        try (FileInputStream fileInput = new FileInputStream(configFile)) {
+        try (FileInputStream fileInput = new FileInputStream(args[0])) {
             LOGGER.info("Config file provided!");
             enrichmentProperties.load(fileInput);
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
+
+        basePath = args[1];
+
+        throttlingLevel = Integer.valueOf(args[2]);
 
         enricher = new Enricher(
                 enrichmentProperties.getProperty("DEREFERENCE_SERVICE_URL"),
